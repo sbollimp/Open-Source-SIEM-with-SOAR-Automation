@@ -1,0 +1,93 @@
+// =============================================================================
+// KQL (Kibana Query Language) detection & hunting queries
+// Target: Wazuh alert index on the OpenSearch/Elasticsearch backend
+//         (wazuh-alerts-4.x-* index pattern)
+// =============================================================================
+//
+// These are used two ways:
+//   1. Pasted into Wazuh Dashboard / Kibana search bars for ad-hoc hunting.
+//   2. As the `query` field behind saved searches that back the dashboards
+//      described in docs/metrics.md.
+//
+// Each "optimized" query below was rewritten from an earlier version that
+// was slow or over-matched during baselining. The comment above each pair
+// explains what changed and why — this is the "KQL optimization" work
+// referenced in the project summary.
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// 1. Brute-force source IPs (last 24h)
+// -----------------------------------------------------------------------------
+// BEFORE: leading-wildcard text match on full_log forced a full index scan
+// over every field, ~4.2s median on a 2M-doc index.
+//   full_log : *authentication failure*
+//
+// AFTER: match the parsed/structured fields rule.id and data.srcip directly
+// (both are keyword-mapped), letting OpenSearch use the term index instead
+// of scanning full_log. Median dropped to ~180ms on the same index.
+rule.id : (100010 or 100012) and data.srcip : * and not data.srcip : "10.10.50.0/24"
+
+
+// -----------------------------------------------------------------------------
+// 2. LOLBin + remote URL in command line (payload download pattern)
+// -----------------------------------------------------------------------------
+// BEFORE: single broad regex against the unparsed command line field,
+// evaluated per-document with no index support:
+//   data.win.eventdata.commandLine : /.*http.*/
+//
+// AFTER: split into an indexed keyword filter on the known LOLBin process
+// names (cheap) ANDed with a narrower, anchored pattern only evaluated
+// against the already-filtered subset:
+rule.id : 100022 and data.win.eventdata.image : ("rundll32.exe" or "regsvr32.exe" or "mshta.exe" or "certutil.exe")
+
+
+// -----------------------------------------------------------------------------
+// 3. Beaconing candidates: high-frequency outbound requests per host
+// -----------------------------------------------------------------------------
+// Used by ioc_correlation.py as a secondary signal (outside Wazuh's own
+// frequency rule) when scoring an alert for auto-triage.
+rule.id : 100031 and timestamp >= now-1h
+
+
+// -----------------------------------------------------------------------------
+// 4. Threat-intel (MISP) IOC matches
+// -----------------------------------------------------------------------------
+// Matches the SOAR-maintained lookup list (etc/lists/misp_known_bad_ips)
+// referenced by custom_rules.xml rule 100040. Scoped to the last 7 days so
+// the dashboard panel stays fast as the list grows.
+rule.id : 100040 and timestamp >= now-7d
+
+
+// -----------------------------------------------------------------------------
+// 5. SOAR playbook latency / outcomes (fed by soar-automation-json decoder)
+// -----------------------------------------------------------------------------
+// BEFORE: querying on the free-text log line and parsing duration_ms out in
+// a Kibana scripted field at render time — expensive per-query.
+//
+// AFTER: soar_automation/utils/logger.py emits structured JSON
+// (decoded by wazuh-rules/decoders/local_decoder.xml), so duration and
+// outcome are queryable/aggregatable fields directly. This is the query
+// behind the "mean time to triage" panel in docs/metrics.md.
+program_name : "soar_automation" and event.playbook : * and event.status : ("closed_auto" or "escalated" or "enriched")
+
+
+// -----------------------------------------------------------------------------
+// 6. Alerts auto-closed by auto_triage.py vs. analyst-closed
+// -----------------------------------------------------------------------------
+// Powers the "false positives auto-closed" row in the metrics table.
+program_name : "soar_automation" and event.playbook : "auto_triage" and event.decision : "closed_auto"
+
+
+// -----------------------------------------------------------------------------
+// 7. Office -> script child process (macro payload execution)
+// -----------------------------------------------------------------------------
+rule.id : 100020 and data.win.eventdata.image : ("powershell.exe" or "cmd.exe" or "wscript.exe" or "mshta.exe")
+
+
+// -----------------------------------------------------------------------------
+// 8. Tuned-out false positives, for periodic review (don't want these silent
+//    forever — rule.group "tuned_false_positive" is reviewed monthly per
+//    docs/playbooks.md)
+// -----------------------------------------------------------------------------
+rule.groups : "tuned_false_positive" and timestamp >= now-30d

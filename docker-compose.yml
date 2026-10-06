@@ -1,0 +1,197 @@
+version: "3.8"
+
+# Open-source SIEM + SOAR stack: Wazuh, TheHive, Cortex, MISP.
+# Lab/demo topology — single node per service, no clustering/TLS hardening.
+# See docs/setup-guide.md for first-run steps (index templates, org creation,
+# analyzer activation, API key generation) that can't be fully automated here.
+
+networks:
+  soar-net:
+    driver: bridge
+
+volumes:
+  wazuh-indexer-data:
+  wazuh-manager-data:
+  thehive-data:
+  cassandra-data:
+  cortex-data:
+  elasticsearch-data:
+  misp-db-data:
+  misp-data:
+
+services:
+  # ---------------------------------------------------------------------
+  # Wazuh — SIEM / XDR: manager + indexer (OpenSearch) + dashboard
+  # ---------------------------------------------------------------------
+  wazuh-indexer:
+    image: wazuh/wazuh-indexer:4.8.0
+    hostname: wazuh-indexer
+    restart: always
+    ports:
+      - "9201:9200"
+    environment:
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - wazuh-indexer-data:/var/lib/wazuh-indexer
+      - ./wazuh/config/wazuh_indexer/wazuh.indexer.yml:/usr/share/wazuh-indexer/config/opensearch.yml:ro
+    networks:
+      - soar-net
+
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.8.0
+    hostname: wazuh-manager
+    restart: always
+    depends_on:
+      - wazuh-indexer
+    ports:
+      - "1514:1514"
+      - "1515:1515"
+      - "514:514/udp"
+      - "55000:55000" # REST API — consumed by soar_automation.integrations.wazuh_client
+    environment:
+      - INDEXER_URL=https://wazuh-indexer:9200
+      - WAZUH_API_USER=${WAZUH_API_USERNAME}
+      - WAZUH_API_PASS=${WAZUH_API_PASSWORD}
+    volumes:
+      - wazuh-manager-data:/var/ossec/data
+      - ../wazuh-rules/custom_rules.xml:/var/ossec/etc/rules/custom_rules.xml:ro
+      - ../wazuh-rules/decoders:/var/ossec/etc/decoders/custom:ro
+      - ./wazuh/config/ossec.conf:/var/ossec/etc/ossec.conf:ro
+    networks:
+      - soar-net
+
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:4.8.0
+    hostname: wazuh-dashboard
+    restart: always
+    depends_on:
+      - wazuh-indexer
+      - wazuh-manager
+    ports:
+      - "443:5601"
+    environment:
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD}
+      - WAZUH_API_URL=https://wazuh-manager
+    networks:
+      - soar-net
+
+  # ---------------------------------------------------------------------
+  # TheHive — case management, backed by Cassandra + Elasticsearch
+  # ---------------------------------------------------------------------
+  cassandra:
+    image: cassandra:4.1
+    hostname: cassandra
+    restart: always
+    environment:
+      - MAX_HEAP_SIZE=1G
+      - HEAP_NEWSIZE=256M
+      - CASSANDRA_CLUSTER_NAME=thehive-cluster
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    networks:
+      - soar-net
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.18
+    hostname: elasticsearch
+    restart: always
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - xpack.security.enabled=false
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - soar-net
+
+  thehive:
+    image: strangebee/thehive:5.3
+    hostname: thehive
+    restart: always
+    depends_on:
+      - cassandra
+      - elasticsearch
+    ports:
+      - "9000:9000" # UI + REST API — soar_automation.integrations.thehive_client
+    command:
+      - --secret
+      - ${THEHIVE_SECRET}
+      - --cql-hostnames
+      - cassandra
+      - --index-backend
+      - elasticsearch
+      - --es-hostnames
+      - elasticsearch
+      - --cortex-hostnames
+      - cortex
+      - --cortex-port
+      - "9001"
+    volumes:
+      - thehive-data:/opt/thp/thehive/data
+    networks:
+      - soar-net
+
+  # ---------------------------------------------------------------------
+  # Cortex — observable enrichment engine (runs the analyzers)
+  # ---------------------------------------------------------------------
+  cortex:
+    image: thehiveproject/cortex:3.1.7
+    hostname: cortex
+    restart: always
+    depends_on:
+      - elasticsearch
+    ports:
+      - "9001:9001" # REST API — soar_automation.integrations.cortex_client
+    environment:
+      - secret=${CORTEX_SECRET}
+      - job_directory=/tmp/cortex-jobs
+    volumes:
+      - cortex-data:/opt/cortex/data
+      - /var/run/docker.sock:/var/run/docker.sock # allows docker-flavored analyzers
+      - ./cortex/application.conf:/etc/cortex/application.conf:ro
+    networks:
+      - soar-net
+
+  # ---------------------------------------------------------------------
+  # MISP — threat intelligence platform (IOC store + correlation)
+  # ---------------------------------------------------------------------
+  misp-db:
+    image: mysql:8.0
+    hostname: misp-db
+    restart: always
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=misp
+      - MYSQL_USER=misp
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+    volumes:
+      - misp-db-data:/var/lib/mysql
+    networks:
+      - soar-net
+
+  misp:
+    image: coolacid/misp-docker:core-latest
+    hostname: misp
+    restart: always
+    depends_on:
+      - misp-db
+    ports:
+      - "8443:443" # UI + REST API — soar_automation.integrations.misp_client
+    environment:
+      - MYSQL_HOST=misp-db
+      - MYSQL_DATABASE=misp
+      - MYSQL_USER=misp
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - ADMIN_EMAIL=${MISP_ADMIN_EMAIL}
+      - ADMIN_PASSWORD=${MISP_ADMIN_PASSWORD}
+      - MISP_BASEURL=https://localhost:8443
+    volumes:
+      - misp-data:/var/www/MISP
+    networks:
+      - soar-net
